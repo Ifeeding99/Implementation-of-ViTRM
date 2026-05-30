@@ -1,0 +1,120 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import einops
+import math
+
+
+class SelfMHA(nn.Module):
+    def __init__(self, embed_dim, n_heads, dropout=0.2):
+        super().__init__()
+        assert embed_dim % n_heads == 0, f'Embedding dimension ({embed_dim}) must be divisible by n_heads {n_heads}!'
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.head_dim = embed_dim // n_heads
+        self.Q_weights = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.K_weights = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.V_weights = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.W_out_weights = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.drop = nn.Dropout(p=dropout)
+
+    def forward(self, x): # x has shape B, seq_len, embed_dim
+        q = self.Q_weights(x)
+        k = self.K_weights(x)
+        v = self.V_weights(x)
+        q = einops.rearrange(q, 'B S (n_heads head_dim) -> B n_heads S head_dim',
+                             B = x.shape[0], S = x.shape[1], n_heads = self.n_heads, head_dim = self.head_dim)
+        k = einops.rearrange(k, 'B S (n_heads head_dim) -> B n_heads S head_dim',
+                             B = x.shape[0], S = x.shape[1], n_heads = self.n_heads, head_dim = self.head_dim)
+        v = einops.rearrange(v, 'B S (n_heads head_dim) -> B n_heads S head_dim',
+                             B = x.shape[0], S = x.shape[1], n_heads = self.n_heads, head_dim = self.head_dim)
+        scores = F.softmax((q @ k.transpose(-1,-2))/math.sqrt(self.head_dim), dim = -1)
+        scores = self.drop(scores)
+        scores = scores @ v
+        scores = einops.rearrange(scores, 'B n_heads S head_dim -> B S (n_heads head_dim)',
+                                  B = x.shape[0], S = x.shape[1], n_heads = self.n_heads, head_dim = self.head_dim)
+        scores = self.W_out_weights(scores)
+        return scores
+    
+
+class SwiGLU(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.W1 = nn.Linear(embed_dim, 2*embed_dim)
+        self.W2 = nn.Linear(embed_dim, 2*embed_dim)
+        self.W3 = nn.Linear(2*embed_dim, embed_dim)
+
+    def forward(self, x):
+        out1 = F.silu(self.W1(x))
+        out2 = self.W2(x)
+        out1 = out1 * out2
+        out1 = self.W3(out1)
+        return out1
+    
+
+class EncoderBlock(nn.Module):
+    def __init__(self, embed_dim, n_heads, dropout=0.2):
+        super().__init__()
+        self.l_norm1 = nn.LayerNorm(embed_dim)
+        self.l_norm2 = nn.LayerNorm(embed_dim)
+        self.mha = SelfMHA(embed_dim=embed_dim, n_heads=n_heads, dropout=dropout)
+        self.ff = SwiGLU(embed_dim=embed_dim)
+
+    def forward(self, x):
+        x = x + self.mha(self.l_norm1(x))
+        x = x + self.ff(self.l_norm2(x))
+        return x
+
+
+
+class Encoder(nn.Module):
+    def __init__(self, n_blocks, embed_dim, n_heads, dropout=0.2):
+        super().__init__()
+        self.enc = [EncoderBlock(embed_dim=embed_dim, n_heads=n_heads, dropout=dropout) for i in range(n_blocks)]
+
+    def forward(self, x):
+        for block in range(x):
+            x = block(x)
+        return x
+    
+
+class ViTRM(nn.Module):
+    def __init__(self, n_blocks, embed_dim, n_heads, 
+                 M, T, n_classes, k=3, dropout=0.2):
+        super().__init__() 
+        # M is the number of steps for refining memory (z) (1st cycle)
+        # T is the number of reasoning steps (for refining y) (2nd cycle)
+        # k is the last elements on dimension 1 of the z vector ([:,-k,:])
+        self.encoder = EncoderBlock(n_blocks, embed_dim, n_heads, dropout)
+        self.y0 = nn.Parameter(torch.randn(1,1,embed_dim))
+        self.z0 = nn.Parameter(torch.randn(1,k,embed_dim))
+        self.classification_head = nn.Linear(embed_dim, n_classes)
+        self.halting_head = nn.Linear(embed_dim, 1)
+        self.M = M
+        self.T = T
+        self.k = k
+
+
+    def refine_memory(self,x,y,z):
+        for m_step in range(self.M):
+            conc = torch.cat([x,y,z], dim=1)
+            conc = self.encoder(conc)
+            z = conc[:,-self.k:,:]
+        return z
+    
+    def update_y(self, y,z):
+        conc = torch.cat([y,z], dim=1)
+        conc = self.encoder(conc)
+        y = conc[:,:-self.k,:]
+        return y
+
+    def forward(self, x, y, z):
+        # we assume that x is shaped B, seq_len, embed_dim
+        # i.e. x is a matrix of embeddings
+        for t_step in range(self.T):
+            z = self.refine_memory(x,y,z)
+            y = self.update_y(y, z)
+        pred = self.classification_head(y.squeeze(1))
+        halting_prob = torch.sigmoid(self.halting_head(y.squeeze(1)))
+        return pred, halting_prob, y, z
+
