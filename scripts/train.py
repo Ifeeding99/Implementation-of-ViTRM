@@ -7,6 +7,7 @@ import tqdm
 import einops
 import numpy as np
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from dataprocessing import get_brain_tumor_data_loader
 
 
 def train_ViTRM(model, train_loader, val_loader, n_epochs, 
@@ -39,7 +40,8 @@ def train_ViTRM(model, train_loader, val_loader, n_epochs,
             y = einops.repeat(model.y0, '1 1 emb_dim -> B 1 emb_dim', B=x.shape[0])
             z = einops.repeat(model.z0, '1 k emb_dim -> B k emb_dim', B=x.shape[0], k=model.k)
             for step in range(n_supevision_steps):
-                classes, h_prob, y, z = model(x, y, z)
+                patches = model.patch_embeddings(x)
+                classes, h_prob, y, z = model(patches, y, z)
                 loss_classification_step = criterion_classification(classes, target)
                 correctly_predicted = (torch.argmax(classes, dim=-1) == target).float() # assuming target has 0,1,2,... as labels
                 halting_loss = criterion_halting(h_prob.squeeze(1), correctly_predicted)
@@ -72,7 +74,8 @@ def train_ViTRM(model, train_loader, val_loader, n_epochs,
                 target = target.to(device)
                 y = einops.repeat(ema_model.module.y0, '1 1 emb_dim -> B 1 emb_dim', B=x.shape[0])
                 z = einops.repeat(ema_model.module.z0, '1 k emb_dim -> B k emb_dim', B=x.shape[0], k=ema_model.module.k)
-                classes, h_prob, y, z = ema_model(x, y, z)
+                patches = ema_model.module.patch_embeddings(x)
+                classes, h_prob, y, z = ema_model(patches, y, z)
                 loss_classification_step = criterion_classification(classes, target)
                 correctly_predicted = (torch.argmax(classes, dim=-1) == target).float() # assuming target has 0,1,2,... as labels
                 halting_loss = criterion_halting(h_prob.squeeze(1), correctly_predicted)
@@ -90,3 +93,18 @@ def train_ViTRM(model, train_loader, val_loader, n_epochs,
 
         print(f'Average validation loss: {np.array(val_losses).mean():.3f}, average validation accuracy: {val_acc.compute():.3f}')
         val_acc.reset()
+
+
+if __name__ == '__main__':
+    train_loader = get_brain_tumor_data_loader(path_to_dataset='/home/ifeeding99/Downloads/brain-tumor-dataset/Training',
+                                                batch_size=1, t_train=True, shuffle=True)
+    
+    val_loader = get_brain_tumor_data_loader(path_to_dataset='/home/ifeeding99/Downloads/brain-tumor-dataset/Testing'
+                                             , batch_size=1, t_train=False, shuffle=False)
+    
+    model = ViTRM(n_blocks=1,embed_dim=100,n_heads=10, patch_size=10,
+                  M = 5, T = 1, n_classes=4, input_img_size=300)
+    
+    train_ViTRM(model, train_loader, val_loader, n_epochs=10, 
+                num_classes=4, n_supevision_steps=5, lr=1e-3, threshold_tau=0.5)
+    

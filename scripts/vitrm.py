@@ -52,6 +52,26 @@ class SwiGLU(nn.Module):
         return out1
     
 
+class SimplePatchEmbeddings(nn.Module):
+    def __init__(self, input_img_size, embed_dim, patch_size, in_channels=3):
+        super().__init__()
+        assert input_img_size % patch_size == 0, f'Input image dimension {input_img_size} should be divisible by patch size ({patch_size})!'
+        self.patchify = nn.Conv2d(in_channels=in_channels, out_channels=embed_dim,
+                                  kernel_size=patch_size, stride=patch_size, padding=0)
+        self.n_total_patches = (input_img_size // patch_size)**2
+        self.n_patches_per_side = input_img_size // patch_size
+        self.pos_embeddings = nn.Parameter(torch.randn(1, self.n_total_patches, embed_dim))
+        self.embed_dim =embed_dim
+
+    def forward(self, x): # x has shape B C H W
+        patches = self.patchify(x) # shape B embed_dim N_patches_per_side N_patches_per_side
+        patches = einops.rearrange(patches, 'B emb_dim n_patches_side_h n_patches_side_w -> B (n_patches_side_h n_patches_side_w) emb_dim',
+                                   n_patches_side_h = self.n_patches_per_side, n_patches_side_w = self.n_patches_per_side, emb_dim = self.embed_dim)
+        pos_emb = einops.repeat(self.pos_embeddings, '1 n_patches emb_dim -> B n_patches emb_dim',
+                                B = x.shape[0], n_patches = self.n_total_patches, emb_dim = self.embed_dim)
+        return patches + pos_emb
+
+
 class EncoderBlock(nn.Module):
     def __init__(self, embed_dim, n_heads, dropout=0.2):
         super().__init__()
@@ -73,19 +93,21 @@ class Encoder(nn.Module):
         self.enc = [EncoderBlock(embed_dim=embed_dim, n_heads=n_heads, dropout=dropout) for i in range(n_blocks)]
 
     def forward(self, x):
-        for block in range(x):
+        for block in self.enc:
             x = block(x)
         return x
     
 
 class ViTRM(nn.Module):
-    def __init__(self, n_blocks, embed_dim, n_heads, 
-                 M, T, n_classes, k=3, dropout=0.2):
+    def __init__(self, n_blocks, embed_dim, n_heads, patch_size,
+                 M, T, n_classes, input_img_size, k=3, dropout=0.2, in_channels=3):
         super().__init__() 
         # M is the number of steps for refining memory (z) (1st cycle)
         # T is the number of reasoning steps (for refining y) (2nd cycle)
         # k is the last elements on dimension 1 of the z vector ([:,-k,:])
-        self.encoder = EncoderBlock(n_blocks, embed_dim, n_heads, dropout)
+        self.patch_embeddings = SimplePatchEmbeddings(input_img_size=input_img_size, 
+                                                      embed_dim=embed_dim, patch_size=patch_size, in_channels=in_channels)
+        self.encoder = Encoder(n_blocks, embed_dim, n_heads, dropout)
         self.y0 = nn.Parameter(torch.randn(1,1,embed_dim))
         self.z0 = nn.Parameter(torch.randn(1,k,embed_dim))
         self.classification_head = nn.Linear(embed_dim, n_classes)
