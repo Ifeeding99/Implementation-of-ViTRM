@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import einops
 import math
-
+import timm 
 
 class SelfMHA(nn.Module):
     def __init__(self, embed_dim, n_heads, dropout=0.2):
@@ -98,15 +98,39 @@ class Encoder(nn.Module):
         return x
     
 
+class ViTPatchifier(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.model = timm.create_model(
+            'vit_base_patch16_224',
+            pretrained=True,
+            num_classes=0 # we don't need the classifier, because we only
+            )             # use the model for the embeddings
+        for param in self.model.parameters(): # no finetuning
+            param.requires_grad = False
+        self.embed_dim = embed_dim
+        self.proj = nn.Linear(in_features=768, out_features=embed_dim, bias=False) # ViT outputs embeddings with embed_dim = 768
+                                                                                   # This is needed to get the produced embedding to the target dim
+        
+    def forward(self, x):
+        return self.proj(self.model(x))
+
+    
+
 class ViTRM(nn.Module):
-    def __init__(self, n_blocks, embed_dim, n_heads, patch_size,
-                 M, T, n_classes, input_img_size, k=3, dropout=0.2, in_channels=3):
+    def __init__(self, n_blocks, embed_dim, n_heads, patch_size, 
+                 M, T, n_classes, input_img_size, k=3, dropout=0.2, in_channels=3,
+                 use_ViT_embeddings = False,):
         super().__init__() 
         # M is the number of steps for refining memory (z) (1st cycle)
         # T is the number of reasoning steps (for refining y) (2nd cycle)
         # k is the last elements on dimension 1 of the z vector ([:,-k,:])
-        self.patch_embeddings = SimplePatchEmbeddings(input_img_size=input_img_size, 
-                                                      embed_dim=embed_dim, patch_size=patch_size, in_channels=in_channels)
+        self.use_ViT_embeddings = use_ViT_embeddings
+        if self.use_ViT_embeddings:
+            self.patch_embeddings = ViTPatchifier(embed_dim=embed_dim)
+        else:
+            self.patch_embeddings = SimplePatchEmbeddings(input_img_size=input_img_size, 
+                                                        embed_dim=embed_dim, patch_size=patch_size, in_channels=in_channels)
         self.encoder = Encoder(n_blocks, embed_dim, n_heads, dropout)
         self.y0 = nn.Parameter(torch.randn(1,1,embed_dim))
         self.z0 = nn.Parameter(torch.randn(1,k,embed_dim))
@@ -118,6 +142,8 @@ class ViTRM(nn.Module):
 
 
     def refine_memory(self,x,y,z):
+        if self.use_ViT_embeddings:
+                x = x.unsqueeze(1) # ViT gives back embeddings shaped like B, embd_dim. But y and z have an extra dimension
         for m_step in range(self.M):
             conc = torch.cat([x,y,z], dim=1)
             conc = self.encoder(conc)
@@ -139,4 +165,17 @@ class ViTRM(nn.Module):
         pred = self.classification_head(y.squeeze(1))
         halting_prob = torch.sigmoid(self.halting_head(y.squeeze(1)))
         return pred, halting_prob, y, z
+    
+
+
+if __name__ == '__main__':
+    model = ViTRM(n_blocks=1,embed_dim=100,n_heads=10, patch_size=10,
+                  M = 5, T = 1, n_classes=4, input_img_size=300, use_ViT_embeddings=True)
+    
+    dummy_input = torch.rand([2,3,224,224])
+    y = einops.repeat(model.y0, '1 1 emb_dim -> B 1 emb_dim', B=dummy_input.shape[0])
+    z = einops.repeat(model.z0, '1 k emb_dim -> B k emb_dim', B=dummy_input.shape[0], k=model.k)
+    patches = model.patch_embeddings(dummy_input)
+    model(patches, y, z)
+    print('done')
 
