@@ -64,13 +64,20 @@ class BrainTumorDataset(Dataset):
         plt.show()
 
 
-def get_brain_tumor_data_loader(path_to_dataset, batch_size, t_train = True, shuffle=True):
+def get_brain_tumor_dataset(path_to_dataset, t_train = True):
     if t_train:
         dataset = BrainTumorDataset(path_to_dataset, train_transforms)
     else:
         dataset = BrainTumorDataset(path_to_dataset, val_transforms)
+    return dataset
+
+
+def get_brain_tumor_data_loader(path_to_dataset, batch_size, t_train = True, shuffle=True):
+    dataset = get_brain_tumor_dataset(path_to_dataset, t_train=t_train)
     loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=shuffle)
     return loader
+
+
 
 
 
